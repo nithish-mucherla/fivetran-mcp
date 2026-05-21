@@ -10,8 +10,14 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 from mcp.server import Server
-from mcp.server.stdio import stdio_server
+from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent
+
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from starlette.applications import Starlette
+from starlette.routing import Route
 
 load_dotenv()
 
@@ -1369,7 +1375,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         tool_config = TOOLS[name]
         expected_schema = tool_config["schema_file"]
 
-        # MANDATORY: Validate schema file before proceeding
         provided_schema = arguments.get("schema_file", "")
         if provided_schema != expected_schema:
             raise ValueError(
@@ -1424,22 +1429,51 @@ async def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     else:
         return await fivetran_request(method, endpoint, json_body=json_body)
 
+# ============================================================================
+# FastAPI & SSE Transport Integration
+# ============================================================================
 
-async def async_main():
-    """Run the MCP server."""
+app = FastAPI(title="Fivetran MCP Server")
+transport = SseServerTransport("/messages")
+
+@app.get("/")
+async def root():
+    return {"status": "Fivetran MCP Server is running", "sse_endpoint": "/sse"}
+
+# Bypassing FastAPI route lifecycle by mapping directly to the ASGI endpoints
+@app.api_route("/sse", methods=["GET"])
+async def handle_sse(request: Request):
+    """Establishes the SSE stream connection for incoming remote clients."""
     if not FIVETRAN_API_KEY or not FIVETRAN_API_SECRET:
-        raise ValueError(
-            "FIVETRAN_API_KEY and FIVETRAN_API_SECRET environment variables must be set. "
-            "Configure them in your .mcp.json or .env file."
+        return JSONResponse(
+            status_code=500,
+            content={"error": "FIVETRAN_API_KEY and FIVETRAN_API_SECRET must be set in environment"}
         )
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    
+    async with transport.connect_sse(
+        request.scope, 
+        request._receive, 
+        request._send
+    ) as (read_stream, write_stream):
+        await server.run(
+            read_stream=read_stream,
+            write_stream=write_stream,
+            initialization_options=server.create_initialization_options()
+        )
 
+async def handle_messages(scope, receive, send):
+    """Raw ASGI handler — bypasses FastAPI entirely, no double-response."""
+    await transport.handle_post_message(scope, receive, send)
+
+# Mount as a raw ASGI app on the /messages path
+app.mount("/messages", app=Starlette(routes=[
+    Route("/", endpoint=handle_messages, methods=["POST"])
+]))
 
 def main():
-    import asyncio
-    asyncio.run(async_main())
-
+    # Ready for deployment platforms (like Cloud Run) that map variable ports dynamically
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run("server:app", host="0.0.0.0", port=port, log_level="info")
 
 if __name__ == "__main__":
     main()
